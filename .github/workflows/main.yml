@@ -1,0 +1,20 @@
+name: RCNGram iOS Build
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-26
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Check Xcode
+        run: xcodebuild -version
+
+      - name: Check Python
+        run: python3 --version
