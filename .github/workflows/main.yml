@@ -1,4 +1,5 @@
-name: RCNGram iOS Build
+
+name: RCNGram IPA Build
 
 on:
   workflow_dispatch:
@@ -6,15 +7,167 @@ on:
 jobs:
   build:
     runs-on: xcode-27
+    timeout-minutes: 360
 
     steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
+      - name: Checkout RCNGram
+        uses: actions/checkout@v5
         with:
           submodules: recursive
 
-      - name: Check Xcode
-        run: xcodebuild -version
+      - name: Check build environment
+        run: |
+          xcodebuild -version
+          python3 --version
 
-      - name: Check Python
-        run: python3 --version
+      - name: Refresh temporary build profiles
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git remote add upstream https://github.com/TelegramMessenger/Telegram-iOS.git
+          git fetch --no-tags --depth=1 upstream master
+
+          for profile in Telegram Intents NotificationContent NotificationService Share WatchApp WatchExtension Widget BroadcastUpload; do
+            git show "upstream/master:build-system/fake-codesigning/profiles/${profile}.mobileprovision" \
+              > "build-system/fake-codesigning/profiles/${profile}.mobileprovision"
+          done
+
+      - name: Prepare private configuration
+        env:
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          api_id = os.environ.get("API_ID", "").strip()
+          api_hash = os.environ.get("API_HASH", "").strip()
+
+          if not api_id or not api_hash:
+              raise SystemExit("API_ID or API_HASH secret is missing")
+
+          source = Path("build-system/appstore-configuration.json")
+          config = json.loads(source.read_text(encoding="utf-8"))
+
+          # These temporary values match Telegram's build profiles.
+          # The final IPA receives the RCNGram Bundle ID below.
+          config["api_id"] = api_id
+          config["api_hash"] = api_hash
+
+          output = Path(os.environ["RUNNER_TEMP"]) / "rcngram-build.json"
+          output.write_text(json.dumps(config), encoding="utf-8")
+
+          print("Private build configuration prepared.")
+          PY
+
+      - name: Import temporary build certificates
+        run: |
+          python3 build-system/Make/ImportCertificates.py \
+            --path build-system/fake-codesigning/certs
+
+      - name: Build iPhone IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 -u build-system/Make/Make.py \
+            --bazelUserRoot="$RUNNER_TEMP/bazel-user-root" \
+            --overrideXcodeVersion \
+            --cacheDir="$RUNNER_TEMP/bazel-cache" \
+            build \
+            --configurationPath="$RUNNER_TEMP/rcngram-build.json" \
+            --codesigningInformationPath="build-system/fake-codesigning" \
+            --configuration=release_arm64 \
+            --outputBuildArtifactsPath="$RUNNER_TEMP/raw-artifacts" \
+            --buildNumber="$GITHUB_RUN_NUMBER"
+
+      - name: Prepare unsigned RCNGram IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RAW="$RUNNER_TEMP/raw-artifacts/Telegram.ipa"
+          WORK="$RUNNER_TEMP/ipa-work"
+          OUTPUT="$RUNNER_TEMP/artifacts"
+
+          test -f "$RAW"
+          mkdir -p "$WORK" "$OUTPUT"
+          ditto -x -k "$RAW" "$WORK"
+
+          python3 - "$WORK/Payload" <<'PY'
+          import plistlib
+          import sys
+          from pathlib import Path
+
+          payload = Path(sys.argv[1])
+          apps = list(payload.glob("*.app"))
+
+          if len(apps) != 1:
+              raise SystemExit(f"Expected one app, found {len(apps)}")
+
+          app = apps[0]
+          old_id = "ph.telegra.Telegraph"
+          new_id = "com.rcnworks.rcngram"
+
+          def replace_values(value):
+              if isinstance(value, str):
+                  return value.replace(old_id, new_id)
+              if isinstance(value, list):
+                  return [replace_values(item) for item in value]
+              if isinstance(value, dict):
+                  return {
+                      key: replace_values(item)
+                      for key, item in value.items()
+                  }
+              return value
+
+          for plist_path in app.rglob("Info.plist"):
+              with plist_path.open("rb") as file:
+                  data = plistlib.load(file)
+
+              data = replace_values(data)
+
+              if plist_path == app / "Info.plist":
+                  data["CFBundleIdentifier"] = new_id
+                  data["CFBundleDisplayName"] = "RCNGram"
+                  data["CFBundleName"] = "RCNGram"
+
+              for entry in data.get("CFBundleURLTypes", []):
+                  schemes = entry.get("CFBundleURLSchemes", [])
+                  entry["CFBundleURLSchemes"] = [
+                      "rcngram" if scheme in ("tg", "telegram") else scheme
+                      for scheme in schemes
+                  ]
+
+              with plist_path.open("wb") as file:
+                  plistlib.dump(data, file, sort_keys=False)
+
+          new_app = app.with_name("RCNGram.app")
+          app.rename(new_app)
+
+          print("RCNGram identity applied.")
+          PY
+
+          find "$WORK/Payload" -type d -name "_CodeSignature" \
+            -prune -exec rm -rf {} +
+
+          find "$WORK/Payload" -type f -name "embedded.mobileprovision" \
+            -delete
+
+          (
+            cd "$WORK"
+            zip -q -r -y "$OUTPUT/RCNGram-unsigned.ipa" Payload
+          )
+
+      - name: Upload RCNGram IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: RCNGram-unsigned-IPA
+          path: ${{ runner.temp }}/artifacts/RCNGram-unsigned.ipa
+          if-no-files-found: error
