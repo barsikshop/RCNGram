@@ -422,7 +422,7 @@ public enum PresentationThemeBaseColor: Int32, CaseIterable {
             case .green:
                 value = 0x29b327
             case .pink:
-                value = 0xeb6ca4
+                value = 0xd81b60s
             case .orange:
                 value = 0xf08200
             case .purple:
